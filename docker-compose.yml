@@ -1,0 +1,72 @@
+services:
+  redis:
+    image: redis:8.2.2-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  worker:
+    build: ./worker
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      RAW_STREAM: syslog:raw
+      RAW_GROUP: syslog-workers
+      CONSUMER_NAME: worker-1
+
+      PARSED_STREAM: syslog:parsed
+      BLOCK_STREAM: syslog:blocklist
+
+      SCORE_ZSET: ip:score
+      SCORE_HASH: ip:score:meta
+
+      # scoring knobs
+      SCORE_INCREMENT_DEFAULT: "1"
+      SCORE_BLOCK_THRESHOLD: "15"
+      SCORE_TTL_SECONDS: "86400"   # 1 day decay window metadata (soft)
+      BLOCK_TTL_SECONDS: "3600"    # suggested block duration
+
+      BATCH_COUNT: "50"
+      BLOCK_MS: "2000"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis-writer:
+    build: ./redis-writer
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      STREAM: syslog:raw
+      PORT: "1814"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  syslog-ng:
+    image: balabit/syslog-ng:4.6.0
+    depends_on:
+      - redis-writer
+    ports:
+      - "1514:1514/udp"    # <-- keep YOUR syslog port as-is
+    volumes:
+      - ./syslog-ng/syslog-ng.conf:/etc/syslog-ng/syslog-ng.conf:ro
+
+    # Override entrypoint so our args are exactly what syslog-ng expects
+    entrypoint: ["/usr/sbin/syslog-ng"]
+    command: ["--no-caps", "-F", "-f", "/etc/syslog-ng/syslog-ng.conf"]
+
+    restart: unless-stopped
+
+  web:
+    build: ./web
+    container_name: blocked-ip-dashboard
+    environment:
+      REDIS_HOST: redis
+      BLOCKLIST_STREAM: syslog:blocklist
+    ports:
+      - "8111:8080"
+    depends_on:
+      - redis
+
+volumes:
+  redis_data:
