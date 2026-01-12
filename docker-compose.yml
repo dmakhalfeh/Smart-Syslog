@@ -50,6 +50,7 @@ services:
       - "1514:1514/udp"    # <-- keep YOUR syslog port as-is
     volumes:
       - ./syslog-ng/syslog-ng.conf:/etc/syslog-ng/syslog-ng.conf:ro
+      - syslog_logs:/var/log/syslog-ng
 
     # Override entrypoint so our args are exactly what syslog-ng expects
     entrypoint: ["/usr/sbin/syslog-ng"]
@@ -63,10 +64,15 @@ services:
     environment:
       REDIS_HOST: redis
       BLOCKLIST_STREAM: syslog:blocklist
+      SCORE_ZSET: ip:score
+      SCORE_HASH: ip:score:meta
+      SCORE_BLOCK_THRESHOLD: "15"
     ports:
       - "8111:8080"
     depends_on:
       - redis
+    restart: unless-stopped
 
 volumes:
   redis_data:
+  syslog_logs:
