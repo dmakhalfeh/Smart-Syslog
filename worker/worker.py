@@ -19,6 +19,7 @@ CONSUMER_NAME = os.environ.get("CONSUMER_NAME", "worker-1")
 
 PARSED_STREAM = os.environ.get("PARSED_STREAM", "syslog:parsed")
 BLOCK_STREAM = os.environ.get("BLOCK_STREAM", "syslog:blocklist")
+BLOCK_KEY_PREFIX = os.environ.get("BLOCK_KEY_PREFIX", "ip:blocked")
 
 SCORE_ZSET = os.environ.get("SCORE_ZSET", "ip:score")
 SCORE_HASH = os.environ.get("SCORE_HASH", "ip:score:meta")
@@ -247,12 +248,14 @@ def normalize_event(raw_event: Dict[str, Any], ip: Optional[str], ip_method: str
 
 
 def maybe_emit_block(r: Redis, ip: str, score: float) -> None:
+    block_key = f"{BLOCK_KEY_PREFIX}:{ip}"
     meta_key = f"{ip}:blocked_at"
-    if r.hget(SCORE_HASH, meta_key) is not None:
+    if r.exists(block_key):
         return
 
+    now_str = str(int(now_ts()))
     payload = {
-        "ts": str(now_ts()),
+        "ts": now_str,
         "ip": ip,
         "score": str(score),
         "action": "block",
@@ -260,8 +263,9 @@ def maybe_emit_block(r: Redis, ip: str, score: float) -> None:
         "reason": "score_threshold",
     }
     r.xadd(BLOCK_STREAM, payload)
-    r.hset(SCORE_HASH, meta_key, str(int(now_ts())))
+    r.hset(SCORE_HASH, meta_key, now_str)
     r.expire(SCORE_HASH, SCORE_TTL_SECONDS)
+    r.setex(block_key, BLOCK_TTL_SECONDS, now_str)
 
 
 def process_message(r: Redis, msg_id: str, fields: Dict[bytes, bytes]) -> None:
