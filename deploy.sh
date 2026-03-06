@@ -39,12 +39,19 @@ rsync -avz \
 echo "🐳 Step 3: Verifying Docker..."
 ssh ${SERVER_USER}@${SERVER_IP} "docker --version && docker compose version"
 
-# Step 4: Build and start services
-echo "🏗️  Step 4: Building and starting services..."
+# Step 4: Stop services, clear volumes and cache
+echo "🧹 Step 4: Stopping services and cleaning up..."
+ssh ${SERVER_USER}@${SERVER_IP} "cd ${DEPLOY_PATH} && \
+  docker compose down -v 2>/dev/null || true && \
+  docker system prune -f && \
+  docker builder prune -f"
+
+# Step 5: Build and start services
+echo "🏗️  Step 5: Building and starting services..."
 ssh ${SERVER_USER}@${SERVER_IP} "cd ${DEPLOY_PATH} && docker compose up -d --build"
 
-# Step 5: Show status
-echo "📊 Step 5: Service status..."
+# Step 6: Show status
+echo "📊 Step 6: Service status..."
 ssh ${SERVER_USER}@${SERVER_IP} "cd ${DEPLOY_PATH} && docker compose ps"
 
 echo ""

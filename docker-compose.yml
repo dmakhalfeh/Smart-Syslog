@@ -64,6 +64,7 @@ services:
     environment:
       REDIS_HOST: redis
       BLOCKLIST_STREAM: syslog:blocklist
+      PARSED_STREAM: syslog:parsed
       SCORE_ZSET: ip:score
       SCORE_HASH: ip:score:meta
       SCORE_BLOCK_THRESHOLD: "15"

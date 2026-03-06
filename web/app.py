@@ -1,15 +1,19 @@
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 import redis
 import os
+import re
+import json
 from datetime import datetime
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Set
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = 6379
 BLOCKLIST_STREAM = os.getenv("BLOCKLIST_STREAM", "syslog:blocklist")
+PARSED_STREAM = os.getenv("PARSED_STREAM", "syslog:parsed")
 SCORE_ZSET = os.getenv("SCORE_ZSET", "ip:score")
 SCORE_HASH = os.getenv("SCORE_HASH", "ip:score:meta")
 SCORE_BLOCK_THRESHOLD = int(os.getenv("SCORE_BLOCK_THRESHOLD", "15"))
+BLOCK_KEY_PREFIX = os.getenv("BLOCK_KEY_PREFIX", "ip:blocked")
 
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 app = Flask(__name__)
@@ -44,6 +48,111 @@ def format_relative_time(ts: str) -> str:
         return "N/A"
 
 
+def extract_ports_from_logs(ip: str) -> Set[str]:
+    """Extract unique ports from logs for a given IP"""
+    ports = set()
+    if not ip or ip == "N/A":
+        return ports
+    
+    try:
+        ip_clean = ip.strip()
+        # Get logs from parsed stream
+        items = r.xrevrange(PARSED_STREAM, max="+", min="-", count=500)
+        
+        # Simple pattern: match dst_port=80, src_port=443, etc.
+        # Case insensitive, handles spaces: dst_port=80, dst_port = 80, DST_PORT=443
+        port_pattern = re.compile(r'(dst_port|src_port|dport|sport|port)\s*=\s*(\d{1,5})', re.IGNORECASE)
+        
+        for entry_id, fields in items:
+            log_ip = str(fields.get("ip", "")).strip()
+            
+            # Only process logs for this specific IP
+            if log_ip != ip_clean:
+                continue
+            
+            # Check message text for dst_port= pattern
+            message = str(fields.get("message", ""))
+            if message:
+                # Find all matches: returns list of tuples like [('dst_port', '80'), ('src_port', '443')]
+                matches = port_pattern.findall(message)
+                for field_name, port_str in matches:
+                    try:
+                        port_num = int(port_str)
+                        if 1 <= port_num <= 65535:
+                            ports.add(str(port_num))
+                    except ValueError:
+                        continue
+            
+            # Also check raw JSON fields
+            raw_json = fields.get("raw", "")
+            if raw_json:
+                try:
+                    raw_data = json.loads(raw_json)
+                    # Check common port field names in raw JSON
+                    for field_name in ["dst_port", "src_port", "dport", "sport", "port", 
+                                      "DST_PORT", "SRC_PORT", "DPORT", "SPORT", "PORT",
+                                      "destination_port", "source_port"]:
+                        port_value = raw_data.get(field_name)
+                        if port_value:
+                            try:
+                                port_num = int(port_value)
+                                if 1 <= port_num <= 65535:
+                                    ports.add(str(port_num))
+                            except (ValueError, TypeError):
+                                pass
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        
+        return ports
+    except Exception as e:
+        import sys
+        print(f"DEBUG: Error extracting ports for {ip}: {e}", file=sys.stderr, flush=True)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return set()
+
+
+def get_ports_for_ip(ip: str) -> str:
+    """Get ports associated with an IP, formatted as comma-separated string"""
+    if not ip or ip == "N/A":
+        return "N/A"
+    
+    try:
+        ports = extract_ports_from_logs(ip)
+        if ports:
+            # Sort ports numerically
+            sorted_ports = sorted([int(p) for p in ports if p.isdigit() and p])
+            if sorted_ports:
+                return ", ".join([str(p) for p in sorted_ports])
+    except Exception as e:
+        print(f"Error getting ports for {ip}: {e}", flush=True)
+    
+    return "N/A"
+
+
+def block_key(ip: str) -> str:
+    return f"{BLOCK_KEY_PREFIX}:{ip}"
+
+
+def is_blocked_ip(ip: str) -> bool:
+    try:
+        return bool(ip) and r.exists(block_key(ip)) == 1
+    except Exception:
+        return False
+
+
+def ttl_seconds_for_ip(ip: str, fallback: str) -> str:
+    if not ip:
+        return fallback
+    try:
+        ttl = r.ttl(block_key(ip))
+        if ttl is None or ttl < 0:
+            return fallback
+        return str(ttl)
+    except Exception:
+        return fallback
+
+
 @app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE, SCORE_BLOCK_THRESHOLD=SCORE_BLOCK_THRESHOLD)
@@ -57,16 +166,21 @@ def blocked():
         out = []
         for entry_id, fields in items:
             ts = fields.get("ts", fields.get("time", fields.get("@timestamp", "")))
+            ip = fields.get("ip", fields.get("src_ip", ""))
+            if not is_blocked_ip(ip):
+                continue
+            ports = get_ports_for_ip(ip)
             out.append({
                 "id": entry_id,
-                "ip": fields.get("ip", fields.get("src_ip", "")),
+                "ip": ip,
                 "score": fields.get("score", "0"),
                 "reason": fields.get("reason", fields.get("rule", "score_threshold")),
                 "ts": ts,
                 "formatted_ts": format_timestamp(ts),
                 "relative_ts": format_relative_time(ts),
-                "ttl_seconds": fields.get("ttl_seconds", "3600"),
+                "ttl_seconds": ttl_seconds_for_ip(ip, fields.get("ttl_seconds", "3600")),
                 "action": fields.get("action", "block"),
+                "ports": ports,
             })
         return jsonify(out)
     except Exception as e:
@@ -83,19 +197,84 @@ def scores():
             # Get metadata
             last_seen = r.hget(SCORE_HASH, f"{ip}:last_seen")
             last_inc = r.hget(SCORE_HASH, f"{ip}:last_inc")
-            blocked_at = r.hget(SCORE_HASH, f"{ip}:blocked_at")
+            blocked = is_blocked_ip(ip)
+            blocked_at = r.hget(SCORE_HASH, f"{ip}:blocked_at") if blocked else None
             
+            ports = get_ports_for_ip(ip)
             out.append({
                 "ip": ip,
                 "score": float(score),
                 "last_seen": format_timestamp(last_seen) if last_seen else "N/A",
                 "relative_last_seen": format_relative_time(last_seen) if last_seen else "N/A",
                 "last_inc": last_inc or "0",
-                "is_blocked": blocked_at is not None,
+                "is_blocked": blocked,
                 "blocked_at": format_timestamp(blocked_at) if blocked_at else None,
-                "status": "blocked" if blocked_at else ("warning" if float(score) >= SCORE_BLOCK_THRESHOLD * 0.7 else "monitoring"),
+                "status": "blocked" if blocked else ("warning" if float(score) >= SCORE_BLOCK_THRESHOLD * 0.7 else "monitoring"),
+                "ports": ports,
             })
         return jsonify(out)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/logs")
+def logs():
+    """Get logs from parsed stream, optionally filtered by IP"""
+    try:
+        ip_filter = request.args.get("ip", "").strip()
+        count = int(request.args.get("count", "500"))
+        
+        # Get recent logs from parsed stream
+        items = r.xrevrange(PARSED_STREAM, max="+", min="-", count=count)
+        out = []
+        
+        for entry_id, fields in items:
+            log_ip = fields.get("ip", "")
+            
+            # Filter by IP if specified
+            if ip_filter and ip_filter.lower() not in log_ip.lower():
+                continue
+            
+            out.append({
+                "id": entry_id,
+                "timestamp": fields.get("ts", ""),
+                "host": fields.get("host", "N/A"),
+                "program": fields.get("program", "N/A"),
+                "message": fields.get("message", ""),
+                "ip": log_ip or "N/A",
+                "ip_role": fields.get("ip_role", "none"),
+                "ip_method": fields.get("ip_method", "none"),
+                "ignored_ip": fields.get("ignored_ip", "0") == "1",
+                "formatted_ts": format_timestamp(fields.get("ts", "")),
+                "relative_ts": format_relative_time(fields.get("ts", "")),
+            })
+        
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/debug/ports/<ip>")
+def debug_ports(ip: str):
+    """Debug endpoint to test port extraction for a specific IP"""
+    try:
+        ports = extract_ports_from_logs(ip)
+        # Also get sample logs for this IP
+        items = r.xrevrange(PARSED_STREAM, max="+", min="-", count=10)
+        sample_logs = []
+        for entry_id, fields in items:
+            if str(fields.get("ip", "")).strip() == ip.strip():
+                sample_logs.append({
+                    "message": fields.get("message", ""),
+                    "raw": fields.get("raw", "")[:200] if fields.get("raw") else ""
+                })
+        
+        return jsonify({
+            "ip": ip,
+            "ports_found": list(ports),
+            "ports_formatted": get_ports_for_ip(ip),
+            "sample_logs": sample_logs[:3]
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -104,7 +283,7 @@ def scores():
 def stats():
     """Get overall statistics"""
     try:
-        blocked_count = r.xlen(BLOCKLIST_STREAM)
+        blocked_count = sum(1 for _ in r.scan_iter(match=f"{BLOCK_KEY_PREFIX}:*"))
         tracked_ips = r.zcard(SCORE_ZSET)
         top_score = 0
         if tracked_ips > 0:
@@ -502,11 +681,12 @@ HTML_TEMPLATE = """
         <div class="tabs">
             <button class="tab active" data-tab="blocked" onclick="switchTab('blocked', this)">Blocked IPs</button>
             <button class="tab" data-tab="scores" onclick="switchTab('scores', this)">IP Scores</button>
+            <button class="tab" data-tab="logs" onclick="switchTab('logs', this)">Logs</button>
         </div>
 
         <div class="content-panel">
             <div class="toolbar">
-                <input type="text" class="search-box" id="searchBox" placeholder="Search IP addresses...">
+                <input type="text" class="search-box" id="searchBox" placeholder="Search IP addresses..." onkeypress="if(event.key==='Enter' && currentTab==='logs') fetchLogs();">
                 <div class="auto-refresh">
                     <label>Auto-refresh:</label>
                     <label class="switch">
@@ -526,11 +706,12 @@ HTML_TEMPLATE = """
                                 <th onclick="sortTable('blocked', 'score')">Score</th>
                                 <th onclick="sortTable('blocked', 'reason')">Reason</th>
                                 <th onclick="sortTable('blocked', 'ts')">Blocked At</th>
+                                <th>Ports</th>
                                 <th>TTL</th>
                             </tr>
                         </thead>
                         <tbody id="blockedTableBody">
-                            <tr><td colspan="5" class="loading">Loading blocked IPs...</td></tr>
+                            <tr><td colspan="6" class="loading">Loading blocked IPs...</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -545,11 +726,29 @@ HTML_TEMPLATE = """
                                 <th onclick="sortTable('scores', 'score')">Score</th>
                                 <th>Status</th>
                                 <th onclick="sortTable('scores', 'last_seen')">Last Seen</th>
+                                <th>Ports</th>
                                 <th>Last Increment</th>
                             </tr>
                         </thead>
                         <tbody id="scoresTableBody">
-                            <tr><td colspan="5" class="loading">Loading IP scores...</td></tr>
+                            <tr><td colspan="6" class="loading">Loading IP scores...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div id="logsPanel" class="hidden">
+                <div class="table-wrapper">
+                    <table id="logsTable">
+                        <thead>
+                            <tr>
+                                <th onclick="sortTable('logs', 'ip')">IP Address</th>
+                                <th onclick="sortTable('logs', 'host')">Host</th>
+                                <th>Message</th>
+                            </tr>
+                        </thead>
+                        <tbody id="logsTableBody">
+                            <tr><td colspan="3" class="loading">Loading logs...</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -561,6 +760,7 @@ HTML_TEMPLATE = """
         let currentTab = 'blocked';
         let blockedData = [];
         let scoresData = [];
+        let logsData = [];
         let sortConfig = { field: null, direction: 'desc' };
         let refreshInterval = null;
         let autoRefreshEnabled = true;
@@ -600,7 +800,7 @@ HTML_TEMPLATE = """
             } catch (error) {
                 console.error('Error fetching blocked IPs:', error);
                 document.getElementById('blockedTableBody').innerHTML = 
-                    '<tr><td colspan="5" class="empty-state">Error loading data</td></tr>';
+                    '<tr><td colspan="6" class="empty-state">Error loading data</td></tr>';
             }
         }
 
@@ -616,6 +816,70 @@ HTML_TEMPLATE = """
             }
         }
 
+        async function fetchLogs() {
+            try {
+                const search = document.getElementById('searchBox').value.trim();
+                const url = search ? `/api/logs?ip=${encodeURIComponent(search)}` : '/api/logs';
+                const res = await fetch(url);
+                logsData = await res.json();
+                renderLogs();
+            } catch (error) {
+                console.error('Error fetching logs:', error);
+                document.getElementById('logsTableBody').innerHTML = 
+                    '<tr><td colspan="3" class="empty-state">Error loading data</td></tr>';
+            }
+        }
+
+        function renderLogs() {
+            const tbody = document.getElementById('logsTableBody');
+            const search = document.getElementById('searchBox').value.toLowerCase();
+            
+            let filtered = logsData.filter(item => {
+                if (!search) return true;
+                const searchLower = search.toLowerCase();
+                return (
+                    item.ip.toLowerCase().includes(searchLower) ||
+                    item.host.toLowerCase().includes(searchLower) ||
+                    item.program.toLowerCase().includes(searchLower) ||
+                    item.message.toLowerCase().includes(searchLower)
+                );
+            });
+
+            if (filtered.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="3" class="empty-state">No logs found</td></tr>';
+                return;
+            }
+
+            if (sortConfig.field) {
+                filtered.sort((a, b) => {
+                    let aVal = a[sortConfig.field];
+                    let bVal = b[sortConfig.field];
+                    
+                    if (sortConfig.field === 'timestamp') {
+                        aVal = parseFloat(aVal) || 0;
+                        bVal = parseFloat(bVal) || 0;
+                    } else {
+                        aVal = String(aVal || '').toLowerCase();
+                        bVal = String(bVal || '').toLowerCase();
+                    }
+                    
+                    if (sortConfig.direction === 'asc') {
+                        return aVal > bVal ? 1 : -1;
+                    } else {
+                        return aVal < bVal ? 1 : -1;
+                    }
+                });
+            }
+
+            tbody.innerHTML = filtered.map(item => `
+                <tr>
+                    <td>${item.ip !== 'N/A' ? `<span class="ip-badge">${item.ip}</span>` : '<span style="color: #718096;">N/A</span>'}</td>
+                    <td>${item.host || 'N/A'}</td>
+                    <td style="white-space: pre-wrap; word-wrap: break-word; max-width: 600px;">${item.message || 'N/A'}</td>
+                </tr>
+            `).join('');
+        }
+
         function renderBlocked() {
             const tbody = document.getElementById('blockedTableBody');
             const search = document.getElementById('searchBox').value.toLowerCase();
@@ -625,7 +889,7 @@ HTML_TEMPLATE = """
             );
 
             if (filtered.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="5" class="empty-state">No blocked IPs found</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No blocked IPs found</td></tr>';
                 return;
             }
 
@@ -656,6 +920,7 @@ HTML_TEMPLATE = """
                         <div>${item.formatted_ts}</div>
                         <small style="color: #718096;">${item.relative_ts}</small>
                     </td>
+                    <td><span style="font-family: monospace; color: #667eea;">${item.ports || 'N/A'}</span></td>
                     <td>${Math.round(item.ttl_seconds / 60)} min</td>
                 </tr>
             `).join('');
@@ -670,7 +935,7 @@ HTML_TEMPLATE = """
             );
 
             if (filtered.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="5" class="empty-state">No tracked IPs found</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No tracked IPs found</td></tr>';
                 return;
             }
 
@@ -701,6 +966,7 @@ HTML_TEMPLATE = """
                         <div>${item.last_seen}</div>
                         <small style="color: #718096;">${item.relative_last_seen}</small>
                     </td>
+                    <td><span style="font-family: monospace; color: #667eea;">${item.ports || 'N/A'}</span></td>
                     <td>+${item.last_inc}</td>
                 </tr>
             `).join('');
@@ -724,12 +990,23 @@ HTML_TEMPLATE = """
             // Show/hide panels
             document.getElementById('blockedPanel').classList.toggle('hidden', tab !== 'blocked');
             document.getElementById('scoresPanel').classList.toggle('hidden', tab !== 'scores');
+            document.getElementById('logsPanel').classList.toggle('hidden', tab !== 'logs');
+            
+            // Update search placeholder
+            const searchBox = document.getElementById('searchBox');
+            if (tab === 'logs') {
+                searchBox.placeholder = 'Search IP addresses, hosts, programs, or messages...';
+            } else {
+                searchBox.placeholder = 'Search IP addresses...';
+            }
             
             // Load data for active tab
             if (tab === 'blocked') {
                 fetchBlocked();
-            } else {
+            } else if (tab === 'scores') {
                 fetchScores();
+            } else if (tab === 'logs') {
+                fetchLogs();
             }
         }
 
@@ -745,8 +1022,10 @@ HTML_TEMPLATE = """
             
             if (tab === 'blocked') {
                 renderBlocked();
-            } else {
+            } else if (tab === 'scores') {
                 renderScores();
+            } else if (tab === 'logs') {
+                renderLogs();
             }
         }
 
@@ -754,8 +1033,10 @@ HTML_TEMPLATE = """
             fetchStats();
             if (currentTab === 'blocked') {
                 fetchBlocked();
-            } else {
+            } else if (currentTab === 'scores') {
                 fetchScores();
+            } else if (currentTab === 'logs') {
+                fetchLogs();
             }
         }
 
@@ -794,8 +1075,18 @@ HTML_TEMPLATE = """
         document.getElementById('searchBox').addEventListener('input', () => {
             if (currentTab === 'blocked') {
                 renderBlocked();
-            } else {
+            } else if (currentTab === 'scores') {
                 renderScores();
+            } else if (currentTab === 'logs') {
+                // For logs, re-fetch from API if IP search is used
+                const search = document.getElementById('searchBox').value.trim();
+                if (search && /^\d+\.\d+\.\d+\.\d+/.test(search)) {
+                    // If it looks like an IP, fetch from API
+                    fetchLogs();
+                } else {
+                    // Otherwise filter client-side
+                    renderLogs();
+                }
             }
         });
 
